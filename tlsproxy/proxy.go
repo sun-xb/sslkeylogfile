@@ -1,51 +1,27 @@
 package tlsproxy
 
 import (
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
+	"fmt"
+	"io"
 	"log"
 	"net"
-	"os"
+	"syscall"
 	"time"
+
+	"github.com/howeyc/gopass"
 )
 
-var tlsServerConfig *tls.Config
-var sslkeylog *os.File
-
-func init() {
-	certPem := []byte(`-----BEGIN CERTIFICATE-----
-MIIBhTCCASugAwIBAgIQIRi6zePL6mKjOipn+dNuaTAKBggqhkjOPQQDAjASMRAw
-DgYDVQQKEwdBY21lIENvMB4XDTE3MTAyMDE5NDMwNloXDTE4MTAyMDE5NDMwNlow
-EjEQMA4GA1UEChMHQWNtZSBDbzBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABD0d
-7VNhbWvZLWPuj/RtHFjvtJBEwOkhbN/BnnE8rnZR8+sbwnc/KhCk3FhnpHZnQz7B
-5aETbbIgmuvewdjvSBSjYzBhMA4GA1UdDwEB/wQEAwICpDATBgNVHSUEDDAKBggr
-BgEFBQcDATAPBgNVHRMBAf8EBTADAQH/MCkGA1UdEQQiMCCCDmxvY2FsaG9zdDo1
-NDUzgg4xMjcuMC4wLjE6NTQ1MzAKBggqhkjOPQQDAgNIADBFAiEA2zpJEPQyz6/l
-Wf86aX6PepsntZv2GYlA5UpabfT2EZICICpJ5h/iI+i341gBmLiAFQOyTDT+/wQc
-6MF9+Yw1Yy0t
------END CERTIFICATE-----`)
-	keyPem := []byte(`-----BEGIN EC PRIVATE KEY-----
-MHcCAQEEIIrYSSNQFaA2Hwf1duRSxKtLYX5CB04fSeQ6tF1aY/PuoAoGCCqGSM49
-AwEHoUQDQgAEPR3tU2Fta9ktY+6P9G0cWO+0kETA6SFs38GecTyudlHz6xvCdz8q
-EKTcWGekdmdDPsHloRNtsiCa697B2O9IFA==
------END EC PRIVATE KEY-----`)
-	cert, err := tls.X509KeyPair(certPem, keyPem)
-	if err != nil {
-		log.Fatal(err)
-	}
-	tlsServerConfig = &tls.Config{Certificates: []tls.Certificate{cert}}
-
-	sslkeylog, err = os.OpenFile("/tmp/sslkeylogfile.txt", os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
-	if err != nil {
-		log.Fatalln(err)
-	}
-}
-
-type clientConn struct {
+type NewConnection struct {
 	conn net.Conn
 	buf  []byte
 }
 
-func (c *clientConn) Read(b []byte) (n int, err error) {
+func (c *NewConnection) Read(b []byte) (n int, err error) {
 	if len(c.buf) > 0 {
 		n := copy(b, c.buf)
 		c.buf = c.buf[n:]
@@ -54,54 +30,160 @@ func (c *clientConn) Read(b []byte) (n int, err error) {
 	return c.conn.Read(b)
 }
 
-func (c *clientConn) Write(b []byte) (n int, err error) {
+func (c *NewConnection) Write(b []byte) (n int, err error) {
 	return c.conn.Write(b)
 }
 
-func (c *clientConn) Close() (err error) {
+func (c *NewConnection) Close() (err error) {
 	return c.conn.Close()
 }
 
-func (c *clientConn) LocalAddr() net.Addr {
+func (c *NewConnection) LocalAddr() net.Addr {
 	return c.conn.LocalAddr()
 }
 
-func (c *clientConn) RemoteAddr() net.Addr {
+func (c *NewConnection) RemoteAddr() net.Addr {
 	return c.conn.RemoteAddr()
 }
 
-func (c *clientConn) SetDeadline(t time.Time) error {
+func (c *NewConnection) SetDeadline(t time.Time) error {
 	return c.conn.SetDeadline(t)
 }
 
-func (c *clientConn) SetReadDeadline(t time.Time) error {
+func (c *NewConnection) SetReadDeadline(t time.Time) error {
 	return c.conn.SetReadDeadline(t)
 }
 
-func (c *clientConn) SetWriteDeadline(t time.Time) error {
+func (c *NewConnection) SetWriteDeadline(t time.Time) error {
 	return c.conn.SetWriteDeadline(t)
 }
 
-func NewProxy(client, server net.Conn) (net.Conn, net.Conn) {
-	var err error = nil
-	var n int = 0
-	var buf [3]byte
-	if n, err = client.Read(buf[:]); err != nil {
-		return client, server
+type TlsProxy struct {
+	sslKeyLogWriter io.Writer
+	caCertificate   *x509.Certificate
+	caPrivateKey    *rsa.PrivateKey
+}
+
+func decryptPemBlock(prompt string, block *pem.Block) error {
+	if x509.IsEncryptedPEMBlock(block) {
+		fmt.Print(prompt)
+		passwd, err := gopass.GetPasswd()
+		if err != nil {
+			return err
+		}
+		data, err := x509.DecryptPEMBlock(block, []byte(passwd))
+		if err != nil {
+			return err
+		}
+		block.Bytes = data
 	}
-	if n != 3 || buf[0] != 22 || buf[1] != 3 || buf[2]>>4 != 0 {
-		server.Write(buf[:n])
-		return client, server
+	return nil
+}
+
+func NewTlsProxy(w io.Writer, caCertificate, caPrivateKey []byte) *TlsProxy {
+	tp := &TlsProxy{
+		sslKeyLogWriter: w,
 	}
-	newClient := clientConn{
-		conn: client,
-		buf:  buf[:n],
+	var err error
+
+	caCertBlock, _ := pem.Decode(caCertificate)
+	if err = decryptPemBlock("cacert password: ", caCertBlock); err != nil {
+		log.Fatalln(err)
 	}
-	//return &newClient, server
-	c := tls.Server(&newClient, tlsServerConfig)
-	s := tls.Client(server, &tls.Config{
+	tp.caCertificate, err = x509.ParseCertificate(caCertBlock.Bytes)
+	if err != nil {
+		log.Fatalln(err)
+	}
+
+	caKeyBlock, _ := pem.Decode(caPrivateKey)
+	if err = decryptPemBlock("cakey password: ", caKeyBlock); err != nil {
+		log.Fatalln(err)
+	}
+	tp.caPrivateKey, err = x509.ParsePKCS1PrivateKey(caKeyBlock.Bytes)
+	if err != nil {
+		log.Fatalln(err)
+	}
+
+	return tp
+}
+
+func (t *TlsProxy) Proxy(conn net.Conn, host string) (err error, c, s net.Conn) {
+	var n int
+	var magic [3]byte
+
+	remote, err := t.connectRemote(host)
+	if err != nil {
+		return err, nil, nil
+	}
+	if n, err = conn.Read(magic[:]); err != nil {
+		return nil, conn, remote
+	}
+	newConn := &NewConnection{
+		conn: conn,
+		buf:  magic[:n],
+	}
+	if n != 3 || magic[0] != 22 || magic[1] != 3 || magic[2]>>4 != 0 {
+		return nil, newConn, remote
+	}
+	tlsServer := tls.Client(remote, &tls.Config{
 		InsecureSkipVerify: true,
-		KeyLogWriter:       sslkeylog,
+		KeyLogWriter:       t.sslKeyLogWriter,
 	})
-	return c, s
+	if err = tlsServer.Handshake(); err != nil {
+		remote.Close()
+		if remote, err = t.connectRemote(host); err != nil {
+			return err, nil, nil
+		}
+		return nil, newConn, remote
+	}
+
+	cert, err := t.generateCert(tlsServer.ConnectionState().PeerCertificates[0])
+	if err != nil {
+		log.Println("create certificate failed:", err)
+		return nil, newConn, remote
+	}
+	tlsClient := tls.Server(newConn, &tls.Config{
+		Certificates: []tls.Certificate{cert},
+	})
+
+	return nil, tlsClient, tlsServer
+}
+
+func (t *TlsProxy) generateCert(remoteCert *x509.Certificate) (tls.Certificate, error) {
+	privateKey, err := rsa.GenerateKey(rand.Reader, 1024)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	cert, err := x509.CreateCertificate(rand.Reader, remoteCert, t.caCertificate, &privateKey.PublicKey, t.caPrivateKey)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+
+	certPem := &pem.Block{
+		Type:  "CERTIFICATE",
+		Bytes: cert,
+	}
+	certPemData := pem.EncodeToMemory(certPem)
+
+	KeyPem := &pem.Block{
+		Type:  "RSA PRIVATE KEY",
+		Bytes: x509.MarshalPKCS1PrivateKey(privateKey),
+	}
+	keyPemData := pem.EncodeToMemory(KeyPem)
+	return tls.X509KeyPair(certPemData, keyPemData)
+}
+
+func (t *TlsProxy) connectRemote(host string) (net.Conn, error) {
+	remote, err := net.Dial("tcp", host)
+	if err != nil {
+		if ne, ok := err.(*net.OpError); ok && (ne.Err == syscall.EMFILE || ne.Err == syscall.ENFILE) {
+			// log too many open file error
+			// EMFILE is process reaches open file limits, ENFILE is system limit
+			log.Println("dial error:", err)
+		} else {
+			log.Println("error connecting to:", host, err)
+		}
+		return nil, err
+	}
+	return remote, nil
 }

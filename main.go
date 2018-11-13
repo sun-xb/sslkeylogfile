@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"net"
 	"os"
@@ -107,6 +108,8 @@ func sanitizeAddr(addr net.Addr) string {
 	}
 }
 
+var tlsProxy *tlsproxy.TlsProxy
+
 func handleConnection(conn *ss.Conn, port string) {
 	var host string
 
@@ -147,27 +150,16 @@ func handleConnection(conn *ss.Conn, port string) {
 		closed = true
 		return
 	}
-	debug.Println("connecting", host)
-	remote, err := net.Dial("tcp", host)
+
+	err, c, s := tlsProxy.Proxy(conn, host)
 	if err != nil {
-		if ne, ok := err.(*net.OpError); ok && (ne.Err == syscall.EMFILE || ne.Err == syscall.ENFILE) {
-			// log too many open file error
-			// EMFILE is process reaches open file limits, ENFILE is system limit
-			log.Println("dial error:", err)
-		} else {
-			log.Println("error connecting to:", host, err)
-		}
 		return
 	}
 	defer func() {
 		if !closed {
-			remote.Close()
+			s.Close()
 		}
 	}()
-	if debug {
-		debug.Printf("piping %s<->%s", sanitizeAddr(conn.RemoteAddr()), host)
-	}
-	c, s := tlsproxy.NewProxy(conn, remote)
 	go func() {
 		ss.PipeThenClose(c, s, func(Traffic int) {
 			passwdManager.addTraffic(port, Traffic)
@@ -176,16 +168,37 @@ func handleConnection(conn *ss.Conn, port string) {
 	ss.PipeThenClose(s, c, func(Traffic int) {
 		passwdManager.addTraffic(port, Traffic)
 	})
+
 	/*
-		go func() {
-			ss.PipeThenClose(conn, remote, func(Traffic int) {
+		debug.Println("connecting", host)
+		remote, err := net.Dial("tcp", host)
+		if err != nil {
+			if ne, ok := err.(*net.OpError); ok && (ne.Err == syscall.EMFILE || ne.Err == syscall.ENFILE) {
+				// log too many open file error
+				// EMFILE is process reaches open file limits, ENFILE is system limit
+				log.Println("dial error:", err)
+			} else {
+				log.Println("error connecting to:", host, err)
+			}
+			return
+		}
+		defer func() {
+			if !closed {
+				remote.Close()
+			}
+		}()
+		if debug {
+			debug.Printf("piping %s<->%s", sanitizeAddr(conn.RemoteAddr()), host)
+		}
+			go func() {
+				ss.PipeThenClose(conn, remote, func(Traffic int) {
+					passwdManager.addTraffic(port, Traffic)
+				})
+			}()
+
+			ss.PipeThenClose(remote, conn, func(Traffic int) {
 				passwdManager.addTraffic(port, Traffic)
 			})
-		}()
-
-		ss.PipeThenClose(remote, conn, func(Traffic int) {
-			passwdManager.addTraffic(port, Traffic)
-		})
 	*/
 
 	closed = true
@@ -456,6 +469,11 @@ func main() {
 	flag.BoolVar((*bool)(&sanitizeIps), "A", false, "anonymize client ip addresses in all output")
 	flag.BoolVar(&udp, "u", false, "UDP Relay")
 	flag.StringVar(&managerAddr, "manager-address", "", "shadowsocks manager listening address")
+
+	caCertFile := flag.String("cacert", "", "cacert file")
+	caKeyFile := flag.String("cakey", "", "cakey file")
+	sslKeyLogFile := flag.String("sslkey", "", "ssl key log file")
+
 	flag.Parse()
 
 	if printVer {
@@ -463,9 +481,24 @@ func main() {
 		os.Exit(0)
 	}
 
+	sslLog, err := os.OpenFile(*sslKeyLogFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error create ssl log file: %s: %v\n", *sslKeyLogFile, err)
+		os.Exit(0)
+	}
+	caCertData, err := ioutil.ReadFile(*caCertFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error reading %s: %v\n", *caCertFile, err)
+		os.Exit(0)
+	}
+	caKeyData, err := ioutil.ReadFile(*caKeyFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error reading %s: %v\n", *caKeyFile, err)
+		os.Exit(0)
+	}
+	tlsProxy = tlsproxy.NewTlsProxy(sslLog, caCertData, caKeyData)
 	ss.SetDebug(debug)
 
-	var err error
 	config, err = ss.ParseConfig(configFile)
 	if err != nil {
 		if !os.IsNotExist(err) {
