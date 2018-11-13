@@ -13,6 +13,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path"
 	"runtime"
 	"strconv"
 	"strings"
@@ -472,7 +473,11 @@ func main() {
 
 	caCertFile := flag.String("cacert", "", "cacert file")
 	caKeyFile := flag.String("cakey", "", "cakey file")
-	sslKeyLogFile := flag.String("sslkey", "", "ssl key log file")
+	sslkey := os.Getenv("SSLKEYLOGFILE")
+	if sslkey == "" {
+		sslkey = path.Join(os.TempDir(), "sslkeylogfile.txt")
+	}
+	sslKeyLogFile := flag.String("sslkey", sslkey, "ssl key log file")
 
 	flag.Parse()
 
