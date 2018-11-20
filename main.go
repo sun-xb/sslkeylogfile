@@ -154,6 +154,7 @@ func handleConnection(conn *ss.Conn, port string) {
 
 	err, c, s := tlsProxy.Proxy(conn, host)
 	if err != nil {
+		conn.Close()
 		return
 	}
 	defer func() {
@@ -468,7 +469,7 @@ func main() {
 	flag.IntVar(&core, "core", 0, "maximum number of CPU cores to use, default is determinied by Go runtime")
 	flag.BoolVar((*bool)(&debug), "d", false, "print debug message")
 	flag.BoolVar((*bool)(&sanitizeIps), "A", false, "anonymize client ip addresses in all output")
-	flag.BoolVar(&udp, "u", false, "UDP Relay")
+	flag.BoolVar(&udp, "u", true, "UDP Relay")
 	flag.StringVar(&managerAddr, "manager-address", "", "shadowsocks manager listening address")
 
 	caCertFile := flag.String("cacert", "", "cacert file")

@@ -22,16 +22,19 @@ type NewConnection struct {
 }
 
 func (c *NewConnection) Read(b []byte) (n int, err error) {
+	var num int = 0
 	if len(c.buf) > 0 {
-		n := copy(b, c.buf)
-		c.buf = c.buf[n:]
-		return n, nil
+		num = copy(b, c.buf)
+		c.buf = c.buf[num:]
 	}
-	return c.conn.Read(b)
+	n, err = c.conn.Read(b[num:])
+	n += num
+	return
 }
 
 func (c *NewConnection) Write(b []byte) (n int, err error) {
-	return c.conn.Write(b)
+	n, err = c.conn.Write(b)
+	return
 }
 
 func (c *NewConnection) Close() (err error) {
@@ -62,6 +65,7 @@ type TlsProxy struct {
 	sslKeyLogWriter io.Writer
 	caCertificate   *x509.Certificate
 	caPrivateKey    *rsa.PrivateKey
+	privateKey      *rsa.PrivateKey
 }
 
 func decryptPemBlock(prompt string, block *pem.Block) error {
@@ -85,6 +89,11 @@ func NewTlsProxy(w io.Writer, caCertificate, caPrivateKey []byte) *TlsProxy {
 		sslKeyLogWriter: w,
 	}
 	var err error
+
+	tp.privateKey, err = rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		log.Fatalln(err)
+	}
 
 	caCertBlock, _ := pem.Decode(caCertificate)
 	if err = decryptPemBlock("cacert password: ", caCertBlock); err != nil {
@@ -122,6 +131,7 @@ func (t *TlsProxy) Proxy(conn net.Conn, host string) (err error, c, s net.Conn) 
 		conn: conn,
 		buf:  magic[:n],
 	}
+
 	if n != 3 || magic[0] != 22 || magic[1] != 3 || magic[2]>>4 != 0 {
 		return nil, newConn, remote
 	}
@@ -150,27 +160,14 @@ func (t *TlsProxy) Proxy(conn net.Conn, host string) (err error, c, s net.Conn) 
 }
 
 func (t *TlsProxy) generateCert(remoteCert *x509.Certificate) (tls.Certificate, error) {
-	privateKey, err := rsa.GenerateKey(rand.Reader, 1024)
+	tlsCert := tls.Certificate{}
+	tlsCert.PrivateKey = t.privateKey
+	cert, err := x509.CreateCertificate(rand.Reader, remoteCert, t.caCertificate, t.privateKey.Public(), t.caPrivateKey)
 	if err != nil {
-		return tls.Certificate{}, err
+		return tlsCert, err
 	}
-	cert, err := x509.CreateCertificate(rand.Reader, remoteCert, t.caCertificate, &privateKey.PublicKey, t.caPrivateKey)
-	if err != nil {
-		return tls.Certificate{}, err
-	}
-
-	certPem := &pem.Block{
-		Type:  "CERTIFICATE",
-		Bytes: cert,
-	}
-	certPemData := pem.EncodeToMemory(certPem)
-
-	KeyPem := &pem.Block{
-		Type:  "RSA PRIVATE KEY",
-		Bytes: x509.MarshalPKCS1PrivateKey(privateKey),
-	}
-	keyPemData := pem.EncodeToMemory(KeyPem)
-	return tls.X509KeyPair(certPemData, keyPemData)
+	tlsCert.Certificate = append(tlsCert.Certificate, cert)
+	return tlsCert, nil
 }
 
 func (t *TlsProxy) connectRemote(host string) (net.Conn, error) {
